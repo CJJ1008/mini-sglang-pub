@@ -5,7 +5,7 @@ files = os.listdir('.')
 
 # 遍历所有条目
 for file in files:
-    # 检查是否是以'my_log'开头的文件（排除目录）
+    # 检查是否是�gpu'开头的文件（排除目录）
     if file.startswith('gpu') and os.path.isfile(file):
         try:
             # 删除文件
@@ -31,7 +31,7 @@ print("操作完成")
 
 # 遍历所有条目
 for file in files:
-    # 检查是否是以'my_log'开头的文件（排除目录）
+    # 检查是否是�gpu'开头的文件（排除目录）
     if file.startswith('gpu') and os.path.isfile(file):
         try:
             # 删除文件
