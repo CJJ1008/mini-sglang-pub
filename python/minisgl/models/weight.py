@@ -79,6 +79,39 @@ def _merge_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Te
             filtered_state_dict[key] = state_dict[key]
     return filtered_state_dict
 
+def _log_cuda_env(tag: str, device: torch.device) -> None:
+    # 只在 CUDA 情况下打印
+    if not torch.cuda.is_available():
+        logger.info(f"[{tag}] torch.cuda not available")
+        return
+    try:
+        dev_count = torch.cuda.device_count()
+        cur = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(cur) if dev_count > 0 else None
+        logger.info(
+            f"[{tag}] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
+            f"torch_cuda_device_count={dev_count} current_device={cur} "
+            f"requested_device={device} "
+            f"torch_version={torch.__version__} cuda_version={torch.version.cuda} "
+            f"cudnn={torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None}"
+        )
+        if props is not None:
+            logger.info(
+                f"[{tag}] current_device_name={props.name} "
+                f"capability={props.major}.{props.minor} "
+                f"total_mem_GiB={props.total_memory/1024**3:.2f}"
+            )
+        # 打印 memory snapshot（轻量）
+        logger.info(
+            f"[{tag}] mem_alloc_GiB={torch.cuda.memory_allocated(cur)/1024**3:.2f} "
+            f"mem_reserved_GiB={torch.cuda.memory_reserved(cur)/1024**3:.2f}"
+        )
+        # 打印默认流句柄（帮助看是否变化）
+        ds = torch.cuda.default_stream(cur)
+        logger.info(f"[{tag}] default_stream={ds}")
+    except Exception as e:
+        logger.info(f"[{tag}] failed to log cuda env: {e}")
+
 
 def load_weight(
     model_path: str,
@@ -180,10 +213,19 @@ def load_weight(
             cpu_state_dict[k] = v
             new_state_dict[k] = torch.empty_like(v, device=device)
         
+        prev_dev = torch.cuda.current_device() 
+        #start_time = time.perf_counter()
+
+        _log_cuda_env("before_mma_init", device)
         #start_time = time.perf_counter()
         mma.init()
         start_time = time.perf_counter()
         
+        _log_cuda_env("after_mma_init", device)
+        
+        torch.cuda.set_device(prev_dev)
+        
+        #Synchronous
         for k, v in cpu_state_dict.items():
             gpu_tensor = new_state_dict[k]
             if v.dtype == torch.bfloat16:
@@ -193,15 +235,96 @@ def load_weight(
                 cpu_data = v.numpy()
                 mma.memcpy(gpu_tensor, cpu_data)
 
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+            torch.cuda.set_device(prev_dev)
+            #torch.cuda.synchronize(prev_dev)
+            #torch.cuda.set_stream(torch.cuda.default_stream(prev_dev)) 
+            #torch.cuda.synchronize(device)
+            new_state_dict[k] = gpu_tensor
 
         state_dict = new_state_dict
+        
+        #batch
+        '''
+        # 1) 收集 batch
+        bf16_gpu_tensors = []
+        bf16_cpu_arrays = []
+
+        other_gpu_tensors = []
+        other_cpu_arrays = []
+
+        for k, v in cpu_state_dict.items():
+            gpu_tensor = new_state_dict[k]
+
+            if v.dtype == torch.bfloat16:
+                bf16_gpu_tensors.append(gpu_tensor.view(torch.int16))
+                bf16_cpu_arrays.append(v.view(torch.int16).numpy())
+            else:
+                other_gpu_tensors.append(gpu_tensor)
+                other_cpu_arrays.append(v.numpy())
+
+        # 2) 批量传输（可分块，避免一次太大）
+        BATCH_CHUNK = 32
+
+        def _chunked_batch_h2d(gpus, cpus):
+            for i in range(0, len(gpus), BATCH_CHUNK):
+                mma.batch_h2d(gpus[i:i+BATCH_CHUNK], cpus[i:i+BATCH_CHUNK])
+                torch.cuda.set_device(prev_dev)
+
+        if bf16_gpu_tensors:
+            _chunked_batch_h2d(bf16_gpu_tensors, bf16_cpu_arrays)
+
+        if other_gpu_tensors:
+            _chunked_batch_h2d(other_gpu_tensors, other_cpu_arrays)
+
+        # 3) ✅ 你问的这句：放在 batch 全部结束之后
+        state_dict = new_state_dict
+        '''
+        
+        #Asynchronous
+        '''
+        # 建议：在进入 use_mma 分支后就把 device 拉回目标卡
+        torch.cuda.set_device(prev_dev)
+
+        # 用一个 CUDA stream 来承载这些 async copy
+        copy_stream = torch.cuda.Stream(device=prev_dev)
+        i=0
+        for k, v in cpu_state_dict.items():
+            gpu_tensor = new_state_dict[k]
+
+            if v.dtype == torch.bfloat16:
+                # bfloat16 按 int16 原样搬运（2 bytes/elem）
+                src = v.contiguous().view(torch.int16).numpy()
+                dst = gpu_tensor.view(torch.int16)
+                nbytes = src.nbytes
+            else:
+                src = v.contiguous().numpy()
+                dst = gpu_tensor
+                nbytes = src.nbytes
+            logger.info(i)
+            i+=1
+
+            # ✅ 异步 H2D：显式传 size（bytes）
+            # 关键点：stream 通常要传底层句柄 copy_stream.cuda_stream
+            mma.h2d_async(dst, src, nbytes, copy_stream)
+            torch.cuda.set_device(prev_dev)
+            #torch.cuda.synchronize(prev_dev)
+
+        state_dict = new_state_dict
+        '''
+
+
+        _log_cuda_env("after_mma_copy", device)
+
+        #torch.cuda.set_device(prev_dev)
+        #torch.cuda.synchronize(prev_dev)
+        torch.cuda.set_stream(torch.cuda.default_stream(prev_dev))
+
+        #_log_cuda_env("after_xiugai", device)
     else:
         state_dict = {k: v.to(device) for k, v in state_dict.items()}
 
     elapsed = time.perf_counter() - start_time
-    torch.cuda.set_stream(torch.cuda.default_stream(device))
+    
     logger.info(f"Transfer completed in {elapsed:.2f}s ({total_bytes / elapsed / 1e9:.2f} GB/s)")
     return _merge_state_dict(state_dict)
 
